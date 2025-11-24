@@ -1,8 +1,9 @@
-import { invariant } from '@zenstackhq/common-helpers';
+import { enumerate, invariant, isPlainObject } from '@zenstackhq/common-helpers';
 import type { BaseCrudDialect, ClientContract, ProceedKyselyQueryFunction } from '@zenstackhq/orm';
 import { getCrudDialect, QueryUtils, RejectedByPolicyReason, SchemaUtils, type CRUD_EXT } from '@zenstackhq/orm';
 import {
     ExpressionUtils,
+    type BinaryExpression,
     type BuiltinType,
     type Expression,
     type MemberExpression,
@@ -12,6 +13,8 @@ import {
     AliasNode,
     BinaryOperationNode,
     ColumnNode,
+    CommonTableExpressionNameNode,
+    CommonTableExpressionNode,
     DeleteQueryNode,
     expressionBuilder,
     ExpressionWrapper,
@@ -318,14 +321,116 @@ export class PolicyHandler<Schema extends SchemaDef> extends OperationNodeTransf
             where: undefined,
         });
 
+        // let from = baseResult.from;
+
+        const allCTEs: CommonTableExpressionNode[] = baseResult.with ? [...baseResult.with.expressions] : [];
+
+        if (baseResult.from) {
+            const authAccessPaths: string[] = [];
+            baseResult.from.froms.forEach((f) => {
+                const tableName = getTableName(f);
+                if (tableName) {
+                    authAccessPaths.push(...this.getPolicyAuthAccessPaths(tableName, 'read'));
+                }
+            });
+            if (authAccessPaths.length > 0) {
+                const authCTE = this.createObjectAsCTEs(this.client.$auth, '$auth', authAccessPaths);
+                allCTEs.push(authCTE);
+            }
+        }
+
         return {
             ...baseResult,
+            with:
+                allCTEs.length > 0
+                    ? {
+                          kind: 'WithNode',
+                          expressions: allCTEs,
+                      }
+                    : undefined,
             where: whereNode,
+        } satisfies SelectQueryNode;
+    }
+
+    private createObjectAsCTEs(
+        data: Record<string, unknown> | Array<Record<string, unknown>> | undefined,
+        name: string,
+        accessPaths: string[],
+    ) {
+        data = data ?? {};
+        if (!data) {
+            return CommonTableExpressionNode.create(
+                CommonTableExpressionNameNode.create(name),
+                ParensNode.create(ValuesNode.create([PrimitiveValueListNode.create([null])])),
+            );
+        }
+
+        const _data = enumerate(data);
+
+        // collect all fields in the data rows
+        let fields: string[] = [];
+        const nestedFields: string[] = [];
+        _data.forEach((item) => {
+            Object.entries(item).forEach(([key, value]) => {
+                if (isPlainObject(value)) {
+                    if (!nestedFields.includes(key)) {
+                        nestedFields.push(key);
+                    }
+                } else {
+                    if (!fields.includes(key)) {
+                        fields.push(key);
+                    }
+                }
+            });
+        });
+
+        // make a final exclusion of nested fields from the main fields list for consistency
+        fields = fields.filter((f) => !nestedFields.includes(f));
+
+        const rows = _data.map((item) =>
+            PrimitiveValueListNode.create(fields.map((f) => (item[f] === undefined ? null : item[f]))),
+        );
+
+        const valuesNode = ValuesNode.create(rows);
+        const selectNode: SelectQueryNode = {
+            kind: 'SelectQueryNode',
+            from: FromNode.create([ParensNode.create(valuesNode)]),
+            selections: fields.map((name, index) =>
+                SelectionNode.create(
+                    AliasNode.create(ColumnNode.create(`column${index + 1}`), IdentifierNode.create(name)),
+                ),
+            ),
         };
+
+        return CommonTableExpressionNode.create(CommonTableExpressionNameNode.create(name), selectNode);
+    }
+
+    private getPolicyAuthAccessPaths(model: string, operation: CRUD_EXT) {
+        const paths: string[] = [];
+        const visitor = new (class extends SchemaUtils.ExpressionVisitor {
+            protected override visitMember(e: MemberExpression): void {
+                if (ExpressionUtils.isCall(e.receiver) && e.receiver.function === 'auth') {
+                    const path = e.members.join('.');
+                    if (!paths.includes(path)) {
+                        paths.push(path);
+                    }
+                }
+                super.visitMember(e);
+            }
+
+            protected override visitBinary(e: BinaryExpression): void {
+                if (['?', '!', '^'].includes(e.op)) {
+                }
+            }
+        })();
+
+        const policies = this.getModelPolicies(model, operation);
+        policies.forEach((p) => visitor.visit(p.condition));
+        return paths;
     }
 
     protected override transformJoin(node: JoinNode) {
-        const table = this.extractTableName(node.table);
+        const table = this.extractTableAndAlias(node.table);
         if (!table) {
             // unable to extract table name, can be a subquery, which will be handled when nested transformation happens
             return super.transformJoin(node);
@@ -766,14 +871,14 @@ export class PolicyHandler<Schema extends SchemaDef> extends OperationNodeTransf
                 if (!node.table) {
                     invariant(false, 'Update query must have a table');
                 }
-                const r = this.extractTableName(node.table);
+                const r = this.extractTableAndAlias(node.table);
                 return r ? { mutationModel: r.model, alias: r.alias } : undefined;
             })
             .when(DeleteQueryNode.is, (node) => {
                 if (node.from.froms.length !== 1) {
                     throw createUnsupportedError('Only one from table is supported for delete');
                 }
-                const r = this.extractTableName(node.from.froms[0]!);
+                const r = this.extractTableAndAlias(node.from.froms[0]!);
                 return r ? { mutationModel: r.model, alias: r.alias } : undefined;
             })
             .exhaustive();
@@ -840,12 +945,12 @@ export class PolicyHandler<Schema extends SchemaDef> extends OperationNodeTransf
         return combinedPolicy;
     }
 
-    private extractTableName(node: OperationNode): { model: string; alias?: string } | undefined {
+    private extractTableAndAlias(node: OperationNode): { model: string; alias?: string } | undefined {
         if (TableNode.is(node)) {
             return { model: node.table.identifier.name };
         }
         if (AliasNode.is(node)) {
-            const inner = this.extractTableName(node.node);
+            const inner = this.extractTableAndAlias(node.node);
             if (!inner) {
                 return undefined;
             }
@@ -869,7 +974,7 @@ export class PolicyHandler<Schema extends SchemaDef> extends OperationNodeTransf
 
     private createPolicyFilterForTables(tables: readonly OperationNode[]) {
         return tables.reduce<OperationNode | undefined>((acc, table) => {
-            const extractResult = this.extractTableName(table);
+            const extractResult = this.extractTableAndAlias(table);
             if (extractResult) {
                 const { model, alias } = extractResult;
                 const filter = this.buildPolicyFilter(model, alias, 'read');
@@ -884,6 +989,7 @@ export class PolicyHandler<Schema extends SchemaDef> extends OperationNodeTransf
             model,
             alias,
             operation,
+            thisName: 'this',
         });
     }
 

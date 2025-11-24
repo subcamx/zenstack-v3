@@ -39,7 +39,6 @@ import {
     type OperationNode,
 } from 'kysely';
 import { match } from 'ts-pattern';
-import { ExpressionEvaluator } from './expression-evaluator';
 import {
     conjunction,
     createUnsupportedError,
@@ -56,6 +55,8 @@ export type ExpressionTransformerContext = {
     operation: CRUD_EXT;
     memberFilter?: OperationNode;
     memberSelect?: SelectionNode;
+    parentContext?: ExpressionTransformerContext;
+    thisName?: string;
 };
 
 // a registry of expression handlers marked with @expr
@@ -241,12 +242,12 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
     private transformCollectionPredicate(expr: BinaryExpression, context: ExpressionTransformerContext) {
         invariant(expr.op === '?' || expr.op === '!' || expr.op === '^', 'expected "?" or "!" or "^" operator');
 
-        if (this.isAuthCall(expr.left) || this.isAuthMember(expr.left)) {
-            const value = new ExpressionEvaluator().evaluate(expr, {
-                auth: this.auth,
-            });
-            return this.transformValue(value, 'Boolean');
-        }
+        // if (this.isAuthCall(expr.left) || this.isAuthMember(expr.left)) {
+        //     const value = new ExpressionEvaluator().evaluate(expr, {
+        //         auth: this.auth,
+        //     });
+        //     return this.transformValue(value, 'Boolean');
+        // }
 
         invariant(
             ExpressionUtils.isField(expr.left) || ExpressionUtils.isMember(expr.left),
@@ -256,15 +257,21 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
         let newContextModel: string;
         const fieldDef = this.getFieldDefFromFieldRef(expr.left, context.model);
         if (fieldDef) {
-            invariant(fieldDef.relation, `field is not a relation: ${JSON.stringify(expr.left)}`);
+            invariant(fieldDef.relation, `field must be a relation: ${JSON.stringify(expr.left)}`);
             newContextModel = fieldDef.type;
         } else {
             invariant(
-                ExpressionUtils.isMember(expr.left) && ExpressionUtils.isField(expr.left.receiver),
+                ExpressionUtils.isMember(expr.left) &&
+                    (ExpressionUtils.isField(expr.left.receiver) || this.isAuthCall(expr.left.receiver)),
                 'left operand must be member access with field receiver',
             );
-            const fieldDef = QueryUtils.requireField(this.schema, context.model, expr.left.receiver.field);
-            newContextModel = fieldDef.type;
+
+            if (this.isAuthCall(expr.left.receiver)) {
+                newContextModel = this.authType;
+            } else {
+                const fieldDef = QueryUtils.requireField(this.schema, context.model, expr.left.receiver.field);
+                newContextModel = fieldDef.type;
+            }
             for (const member of expr.left.members) {
                 const memberDef = QueryUtils.requireField(this.schema, newContextModel, member);
                 newContextModel = memberDef.type;
@@ -275,6 +282,8 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
             ...context,
             model: newContextModel,
             alias: undefined,
+            parentContext: context,
+            thisName: undefined,
         });
 
         if (expr.op === '!') {
@@ -380,6 +389,13 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
     @expr('call')
     // @ts-ignore
     private _call(expr: CallExpression, context: ExpressionTransformerContext) {
+        if (this.isAuthCall(expr)) {
+            return {
+                kind: 'SelectQueryNode',
+                from: FromNode.create([TableNode.create('$auth')]),
+            } satisfies SelectQueryNode;
+        }
+
         const result = this.transformCall(expr, context);
         return result.toOperationNode();
     }
@@ -450,9 +466,13 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
     @expr('member')
     // @ts-ignore
     private _member(expr: MemberExpression, context: ExpressionTransformerContext) {
-        // `auth()` member access
-        if (this.isAuthCall(expr.receiver)) {
-            return this.valueMemberAccess(this.auth, expr, this.authType);
+        // // `auth()` member access
+        // if (this.isAuthCall(expr.receiver)) {
+        //     return this.valueMemberAccess(this.auth, expr, this.authType);
+        // }
+
+        if (this.isAuthMember(expr)) {
+            return this.transformAuthMember(expr, context);
         }
 
         // `before()` member access
@@ -465,8 +485,10 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
         }
 
         invariant(
-            ExpressionUtils.isField(expr.receiver) || ExpressionUtils.isThis(expr.receiver),
-            'expect receiver to be field expression or "this"',
+            ExpressionUtils.isField(expr.receiver) ||
+                ExpressionUtils.isThis(expr.receiver) ||
+                // this.isAuthCall(expr.receiver),
+                'expect receiver to be field expression or "this"',
         );
 
         let members = expr.members;
@@ -476,7 +498,9 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
         if (ExpressionUtils.isThis(expr.receiver)) {
             if (expr.members.length === 1) {
                 // `this.relation` case, equivalent to field access
-                return this._field(ExpressionUtils.field(expr.members[0]!), context);
+
+                const thisContext = this.findContextWithThisName(context, 'this');
+                return this._field(ExpressionUtils.field(expr.members[0]!), thisContext);
             } else {
                 // transform the first segment into a relation access, then continue with the rest of the members
                 const firstMemberFieldDef = QueryUtils.requireField(this.schema, context.model, expr.members[0]!);
@@ -518,6 +542,7 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
                     ...restContext,
                     model: fromModel,
                     alias: undefined,
+                    parentContext: context,
                 });
 
                 if (currNode) {
@@ -547,6 +572,29 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
             ...receiver,
             selections: [SelectionNode.create(AliasNode.create(currNode!, IdentifierNode.create('$t')))],
         };
+    }
+
+    private transformAuthMember(expr: MemberExpression, _context: ExpressionTransformerContext) {
+        const parts = [...expr.members];
+        const field = parts.pop()!;
+        const tableName = `$auth${parts.length > 0 ? `$${parts.join('$')}` : ''}`;
+        return {
+            kind: 'SelectQueryNode',
+            from: FromNode.create([TableNode.create(tableName)]),
+            selections: [SelectionNode.create(ColumnNode.create(field))],
+        } satisfies SelectQueryNode;
+    }
+
+    private findContextWithThisName(context: ExpressionTransformerContext, thisName: string) {
+        let currentContext: ExpressionTransformerContext | undefined = context;
+        while (currentContext) {
+            if (currentContext.thisName === thisName) {
+                return currentContext;
+            }
+            currentContext = currentContext.parentContext;
+        }
+        invariant(currentContext, `No context found with thisName: ${thisName}`);
+        return currentContext;
     }
 
     private valueMemberAccess(receiver: any, expr: MemberExpression, receiverType: string) {
@@ -581,7 +629,6 @@ export class ExpressionTransformer<Schema extends SchemaDef> {
         let condition: OperationNode;
         if (ownedByModel) {
             // `fromModel` owns the fk
-
             condition = conjunction(
                 this.dialect,
                 keyPairs.map(({ fk, pk }) => {
